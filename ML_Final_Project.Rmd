@@ -1,0 +1,334 @@
+---
+title: "Practical Machine Learning Final Project"
+output: html_document
+---
+
+```{r global, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. 
+They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+### Data
+
+The training data for this project are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The data for this project come from this source: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har. If you use the document you create for this class for any purpose please cite them as they have been very generous in allowing their data to be used for this kind of assignment.
+
+### What you should submit:
+
+The goal of your project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set. You may use any of the other variables to predict with. You should create a report describing how you built your model, how you used cross validation, what you think the expected out of sample error is, and why you made the choices you did. You will also use your prediction model to predict 20 different test cases.
+
+## Preparing the environment
+
+```{r setup, echo = TRUE, results = 'hide', message=FALSE}
+library(tidyverse); library(knitr); library(stargazer)
+library(corrplot); library(caret); library(rpart); library(rattle)
+library(foreach); library(parallel); library(doParallel)
+
+set.seed(11249)
+
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+trainingURL <- 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'
+testingURL <- 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'
+```
+
+## Exploratory Analysis on the Training Set
+
+70% of the dataset will be used as training, with the remaining 30 percent used for validation test set.
+
+```{r exploratory, echo = TRUE, cache = TRUE}
+training <- read.csv(url(trainingURL))
+
+inTrain  <- createDataPartition(training$classe, p=0.7, list=FALSE)
+train_df <- training[inTrain, ]
+str(train_df)
+```
+
+The dataset includes categorical variables that code information about the individuals, such as their names and the date of the observation. I will exclude them from the dataset. Also, quite a few variables seem to have mostly NA values. Additionally, I will explore if any variable has near zero variance. 
+
+```{r NAs, echo = TRUE, cache = TRUE}
+kable(table(sapply(train_df, function(x) mean(is.na(x)))),
+      caption = "Frequency of NAs in Variables"
+      )
+nearZeroVar(train_df)
+```
+
+67 of the variables have an extremely high number of NA observations. Using \nearZeroVar also shows 51 variables can be excluded since they display exceedingly low variability.
+
+The function cleanUp will take a data frame in input and return a list containing a train and a test data frames that have received exactly the same treatment: the variables containing identification data on the individuals will be discarded, as well as those with near zero variance and the ones containing NAs.
+
+```{r cleanUp, echo = TRUE, message=FALSE, cache = TRUE}
+cleanUp <- function(df) {
+      
+      inTrain  <- createDataPartition(df$classe, p=0.7, list=FALSE)
+      train_df <- df[inTrain, ] %>% 
+            select(-c(1:5))
+      test_df  <- df[-inTrain, ] %>% 
+            select(-c(1:5))
+      
+      remove <- nearZeroVar(train_df)
+      train_df <- train_df %>% select(-remove)
+      test_df <- test_df %>% select(-remove)
+      
+      remove <- sapply(train_df, anyNA)
+      train_df <- train_df[, remove == FALSE]
+      test_df <- test_df[, remove == FALSE]
+      return <- list(train_df, test_df)
+}
+
+x <- cleanUp(training)
+trainSet <- x[[1]]
+testSet <- x[[2]]
+rm(x)
+str(trainSet)
+```
+
+Doing so reduces the amount of variables to 54.
+
+## Correlation Matrix
+
+Plotting the correlation matrix for the remaining variables will help assessing if some of them display an extreme level of correlation and might be candidates to be excluded, or whether we could use some preprocessing techniques to reduce their effects.
+
+```{r corPlot, echo = TRUE, message=FALSE, cache = TRUE}
+corMatrix <- cor(trainSet[, -54])
+corrplot(corMatrix, order = "FPC",
+         method = "circle", 
+         type = "upper", 
+         tl.cex = 0.5, tl.col = "black")
+```
+
+```{r HiCor, echo = TRUE, message=FALSE, cache = TRUE}
+(hiCorr = findCorrelation(corMatrix, cutoff=0.8))
+```
+
+One can observe that indeed a few variables are very highly correlated. I will later use PCA as one of the modeling techniques to see if it improves the accuracy of the predictions, but for now we will keep them in the data.
+
+## Classification Trees
+
+A first attempt will use classification trees. I will estimate the model, plot the dendogram via the Rattle package, then use the model on the test set portion of the data to assess its predictive accuracy and tabulate the resulting confusion matrix.
+
+```{r Trees, echo = TRUE, message=FALSE, cache = TRUE}
+modFitTrees <- rpart(classe ~ ., method = "class",
+                     data = trainSet,
+                     control = rpart.control(xval = 30, maxdepth = 30))
+
+fancyRpartPlot(modFitTrees)
+
+predictTrees <- predict(modFitTrees, 
+                        newdata=testSet, 
+                        type="class")
+
+confMatTrees <- confusionMatrix(predictTrees, testSet$classe)
+print(confMatTrees)
+```
+
+The accuracy of the classification trees model is quite low at 0.7419, although a Kappa of 0.6731 is respectable. The simultaneous relatively high Kappa and not impressive observed accuracy tells us the expected accuracy for this problem is quite low. Nevertheless, we will try to improve on this result using different methods.
+
+## Defining Control Parameters for Bagging, Random Forest and Boosting
+
+I start by defining sets of control parameters that will be used for bagging, random forest and boosting: one uses bootstrapping with 25 repetitions, a second one uses crossvalidation and finally a third uses repeated crossvalidation with 5 repetitions.
+
+```{r Controls, echo = TRUE, message=FALSE, cache = TRUE}
+fitControlBOOT <- trainControl(method = "boot",
+                               number = 25,
+                               allowParallel = TRUE)
+
+fitControlCV <- trainControl(method = "cv",
+                           number = 5,
+                           allowParallel = TRUE)
+
+fitControlRCV <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 5,
+                           allowParallel = TRUE)
+```
+
+## Bagging
+
+```{r Bagging, echo = TRUE, message=FALSE, cache = TRUE}
+modFitBag <- train(classe ~ ., method="treebag",
+                   data = trainSet, 
+                   trControl = fitControlBOOT)
+print(modFitBag)
+
+
+modFitBag2 <- train(classe ~ ., method="treebag",
+                    data = trainSet, 
+                    trControl = fitControlRCV)
+print(modFitBag2)
+```
+
+Bagging dramatically improves the accuracy observed with classification trees: using repeated cross validation control function we achieve accuracy of 0.9940 and Kappa equal to 0.9925.
+
+## Random Forest
+
+```{r Random_Forest, echo = TRUE, message=FALSE, cache = TRUE}
+modFitRF <- train(classe ~ ., method="rf",
+                  data = trainSet, 
+                  trControl = fitControlBOOT)
+
+modFitRF2 <- train(classe ~ ., method="rf",
+                  data = trainSet, 
+                  trControl = fitControlCV)
+
+modFitRF3 <- train(classe ~ ., method="rf",
+                   data = trainSet, 
+                   trControl = fitControlRCV)
+
+print(modFitRF)
+print(modFitRF2)
+print(modFitRF3)
+
+plot(modFitRF3)
+```
+
+Random Forest further improves the results from Bagging, regardless of the control function used. Using repeated cross validation the observed accuracy is 0.9975 and Kappa 0.9968, obtained with mtry = 27. Such a high level of accuracy should raise concern that the model is overfitting the data.
+
+## Random Forest with PCA pre-processing
+
+Given that I had doubts about some of the variables displaying high level of correlation, I also try to apply principal component analysis in the pre processing phase of random forest.
+
+```{r PCA, echo = TRUE, message=FALSE, cache = TRUE, warning = FALSE}
+modFitPCA <- train(classe ~ ., method="rf", preProcess="pca",
+                   data = trainSet,
+                   trControl = fitControlBOOT,
+                   verbose = FALSE)
+
+print(modFitPCA)
+```
+
+Accuracy decreases quite substantially to 0.9453.
+
+## Boosting
+```{r Boosting, echo = TRUE, message=FALSE, cache = TRUE}
+modFitGBM <- train(classe ~ ., method="gbm",
+                  data = trainSet, 
+                  trControl = fitControlCV,
+                  verbose = FALSE)
+print(modFitGBM)
+
+
+
+modFitGBM2 <- train(classe ~ ., method="gbm",
+                   data = trainSet, 
+                   trControl = fitControlBOOT,
+                   verbose = FALSE)
+print(modFitGBM2)
+```
+
+Boosting obtains very good results, but fails to improve the levels of accuracy reached with random forest methods.
+
+## Out of Sample Results
+
+Next I will compare the best performing models of each type on the test set to observe their out of sample performance.
+
+```{r Predict, echo = TRUE, message=FALSE, cache = TRUE}
+
+predictBag <- predict(modFitBag2, newdata = testSet)
+confMatrixBag <- confusionMatrix(predictBag, testSet$classe)
+
+predictRF3 <- predict(modFitRF3, newdata = testSet)
+confMatrixRF3 <- confusionMatrix(predictRF3, testSet$classe)
+
+predictGBM <- predict(modFitGBM, newdata = testSet)
+confMatrixGBM <- confusionMatrix(predictGBM, testSet$classe)
+
+predictPCA <- predict(modFitPCA, newdata = testSet)
+confMatrixPCA <- confusionMatrix(predictPCA, testSet$classe)
+```
+
+
+```{r conMatPlot, echo = TRUE, message=FALSE, cache = TRUE}
+confMatPlot = function(confMat, MainTitle, SubTitle, shouldPlot = T) {
+      x.orig = confMat; rm(confMat)  
+      n = nrow(x.orig)  
+      opar <- par(mar = c(5.1, 8, 3, 2))
+      x <- x.orig
+      x <- log(x + 0.5)  
+      x[x < 0] <- NA
+      diag(x) <- -diag(x) 
+      image(1:n, 1:n,  
+            -t(x)[, n:1],  
+            xlab = 'Actual', ylab = '',
+            col = colorRampPalette(c("darkred", "white", "steelblue"), 
+                                   bias = 1.65)(100),
+            xaxt = 'n', yaxt = 'n'
+      )
+      text(rep(1:n, each = n), rep(n:1, times = n), 
+           labels = sub('^0$', '', round(c(x.orig), 0)))
+      
+      axis(1, at = 1:n, labels = rep("", n), cex.axis = 0.8)
+      axis(2, at = n:1, labels = rep("", n), cex.axis = 0.8)
+      
+      text(cex = 1, x = (1:n), y = -0.1, colnames(x), xpd = T, srt = 20, adj = 0)
+      text(cex = 1, y = (n:1), x = +0.1, colnames(x), xpd = T, srt = 20, adj = 0)
+      
+      mtext(side=3, line=1.3, at=3, adj=0.5, cex=1.6, MainTitle)
+      mtext(side=3, line=0.4, at=3, adj=0.5, cex=.9, SubTitle)
+
+      title(ylab = 'Predicted', line = 6)
+      
+      abline(h = 0:n + 0.5, col = 'gray')
+      abline(v = 0:n + 0.5, col = 'gray')
+      box(lwd = 1, col = 'gray')
+      par(opar)
+}
+
+confMatPlot(confMatrixRF3$table, "Random Forest", 
+            paste("Accuracy =", round(confMatrixRF3$overall['Accuracy'], 4), 
+                  "   Kappa =", round(confMatrixRF3$overall['Kappa'], 4) ))
+```
+
+As evidenced in the above confusion matrix, by far the best out of sample results are provided by the Random Forest method, which misclassifies only 7 observations. Using PCA pre-processing does not improve the accuracy of predictions. Bagging and Boosting methods also perform remarkably well, but worse than Random Forest.
+The confusion matrixes for all methods are attached in the appendix.
+
+## Testing on the Prediction Set
+
+I apply now the Random Forest model to the 20 observations dataset for the quiz, and print the predictions.
+
+```{r Predictions, echo = TRUE, message=FALSE, cache = TRUE}
+quizURL <- 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'
+
+QUIZ <- read.csv(url(quizURL))
+predictQUIZ <- predict(modFitRF3, newdata = QUIZ)
+predictQUIZ
+
+```
+
+The random forest model predictions are 100% correct for the quiz values.
+
+## APPENDIX
+
+```{r Appendix, echo = TRUE, message=FALSE, cache = TRUE}
+confMatPlot(confMatTrees$table, "Decision Trees", 
+            paste("Accuracy =", round(confMatTrees$overall['Accuracy'], 4), 
+                  "   Kappa =", round(confMatTrees$overall['Kappa'], 4) ))
+
+confMatPlot(confMatrixBag$table, "Bagging", 
+            paste("Accuracy =", round(confMatrixBag$overall['Accuracy'], 4), 
+                  "   Kappa =", round(confMatrixBag$overall['Kappa'], 4) ))
+
+confMatPlot(confMatrixPCA$table, "Random Forest with PCA pre-processing", 
+            paste("Accuracy =", round(confMatrixPCA$overall['Accuracy'], 4), 
+                  "   Kappa =", round(confMatrixPCA$overall['Kappa'], 4) ))
+
+confMatPlot(confMatrixGBM$table, "Boosting", 
+            paste("Accuracy =", round(confMatrixGBM$overall['Accuracy'], 4), 
+                  "   Kappa =", round(confMatrixGBM$overall['Kappa'], 4) ))
+
+stopCluster(cluster)
+registerDoSEQ()
+
+```
